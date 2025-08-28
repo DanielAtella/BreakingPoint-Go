@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,14 +12,15 @@ import (
 )
 
 var (
-	modelName        string
-	networkName      string
-	bpsSystem        string
-	bpsUser          string
-	bpsPass          string
-	slotNumber       = 1
-	portList         = []int{0, 1, 4, 5}
+	modelName         string
+	networkName       string
+	bpsSystem         string
+	bpsUser           string
+	bpsPass           string
+	slotNumber        = 1
+	portList          = []int{0, 1, 4, 5}
 	modelComponentAct []string
+	runID             int
 )
 
 func loginToBps() *client.BPS {
@@ -30,16 +32,16 @@ func loginToBps() *client.BPS {
 }
 
 func setActiveComponents(bps *client.BPS) error {
-	fmt.Println("Ajustando estado dos componentes do Test Model...")
+	fmt.Println("Adjusting Test Model components state...")
 
 	compsRaw, err := bps.TestModel.ListComponents()
 	if err != nil {
-		return fmt.Errorf("falha ao listar componentes: %w", err)
+		return fmt.Errorf("failed to list components: %w", err)
 	}
 
 	comps, ok := compsRaw.([]interface{})
 	if !ok {
-		return fmt.Errorf("resposta inesperada ao listar componentes: %#v", compsRaw)
+		return fmt.Errorf("unexpected response while listing components: %#v", compsRaw)
 	}
 
 	activeWanted := make(map[string]bool)
@@ -58,28 +60,31 @@ func setActiveComponents(bps *client.BPS) error {
 
 		idStr, ok := c["id"].(string)
 		if !ok {
-			return fmt.Errorf("id do componente não é string: %#v", c["id"])
+			return fmt.Errorf("component ID is not a string: %#v", c["id"])
 		}
 
 		active := boolValue(c["active"])
 		wantActive := activeWanted[label]
 
 		if active != wantActive {
-			fmt.Printf("Alterando componente '%s' para ativo=%v\n", label, wantActive)
+			stateStr := "inactive"
+			if wantActive {
+				stateStr = "active"
+			}
+			fmt.Printf("Component '%s' state changed to %s\n", label, stateStr)
+
 			if _, err := bps.TestModel.SetComponentActive(idStr, wantActive); err != nil {
-				return fmt.Errorf("falha ao atualizar componente %s: %w", label, err)
+				return fmt.Errorf("failed to update component %s: %w", label, err)
 			}
 			changed = true
-		} else {
-			fmt.Printf("Componente '%s' já está ativo=%v, sem alterações\n", label, active)
 		}
 	}
 
 	if changed {
-		fmt.Println("Salvando alterações dos componentes...")
+		fmt.Println("Saving component changes...")
 		_, err := bps.TestModel.Save(modelName, true)
 		if err != nil {
-			return fmt.Errorf("falha ao salvar componentes: %w", err)
+			return fmt.Errorf("failed to save components: %w", err)
 		}
 	}
 
@@ -145,37 +150,28 @@ func unreservePorts(bps *client.BPS) {
 	}
 }
 
-func pollTestProgress(bps *client.BPS, runID interface{}) (map[string]interface{}, error) {
-	fmt.Println("Polling test progress...")
-	runIDStr := fmt.Sprintf("%v", runID)
-	path := fmt.Sprintf("/topology/runningTest/TEST-%s", runIDStr)
+func runTestAndPoll(bps *client.BPS, modelName string) error {
+	runID, err := bps.RunTest(modelName, 2, false)
+	if err != nil {
+		return fmt.Errorf("run test error: %w", err)
+	}
+
+	fmt.Printf("Test running with runID: %v\n", runID)
 
 	var lastData map[string]interface{}
 	for {
-		resp, err := bps.Get(path, nil, nil)
+		lastData, err = bps.PollTestProgress(runID)
 		if err != nil {
-			return lastData, fmt.Errorf("error getting runningTest info: %w", err)
+			return fmt.Errorf("poll test progress error: %w", err)
 		}
 
-		if resp == nil {
-			fmt.Println("Test completed and resource no longer available, ending polling.")
+		if gone, ok := lastData["resource_gone"].(bool); ok && gone {
+			fmt.Println("\nTest completed/cancelled; resource no longer available, ending polling.")
 			break
 		}
 
-		data, ok := resp.(map[string]interface{})
-		if !ok {
-			return lastData, fmt.Errorf("unexpected response type: %#v", resp)
-		}
-		lastData = data
-
-		progress := intValue(data["progress"])
-		initProgress := intValue(data["initProgress"])
-		phase := strValue(data["phase"])
-		state := strValue(data["state"])
-		completed := boolValue(data["completed"])
-
-		fmt.Printf("Phase: %s, State: %s, Progress: %d%%, InitProgress: %d%%, Completed: %v\n",
-			phase, state, progress, initProgress, completed)
+		progress := intValue(lastData["progress"])
+		completed := boolValue(lastData["completed"])
 
 		if completed || progress >= 100 {
 			fmt.Println("Test completed.")
@@ -184,84 +180,57 @@ func pollTestProgress(bps *client.BPS, runID interface{}) (map[string]interface{
 
 		time.Sleep(5 * time.Second)
 	}
-	return lastData, nil
-}
 
-func intValue(v interface{}) int {
-	switch t := v.(type) {
-	case float64:
-		return int(t)
-	case int:
-		return t
-	case nil:
-		return 0
-	default:
-		return 0
-	}
-}
-
-func strValue(v interface{}) string {
-	if v == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", v)
-}
-
-func boolValue(v interface{}) bool {
-	switch t := v.(type) {
-	case bool:
-		return t
-	case nil:
-		return false
-	default:
-		return false
-	}
-}
-
-func runTestAndPoll(bps *client.BPS, modelName string) error {
-	result, err := bps.TestModel.Run(modelName, 2, false)
-	if err != nil {
-		return fmt.Errorf("run test error: %w", err)
-	}
-
-	runID, ok := result.(map[string]interface{})["runid"]
-	if !ok {
-		return fmt.Errorf("runid not found in run result")
-	}
-
-	fmt.Printf("Test running with runid: %v\n", runID)
-	_, err = pollTestProgress(bps, runID)
-	if err != nil {
-		return err
-	}
-
-	stats, err := bps.TestModel.RealTimeStats(
-		int(runID.(float64)), 
-		"summary",            
-		-1,                   
-		1,                    
-		"",                   
-		[]string{},           
-	)
-
+	runIDInt := toInt(runID)
+	stats, err := bps.TestModel.RealTimeStats(runIDInt, "summary", -1, 1, "", []string{})
 	if err != nil {
 		return fmt.Errorf("failed to get realTimeStats: %w", err)
 	}
-
 	var finalProgress interface{}
 	if statsMap, ok := stats.(map[string]interface{}); ok {
 		finalProgress = statsMap["progress"]
 	}
-
 	fmt.Printf("Final progress: %v%%\n", finalProgress)
 
-	report, err := bps.Reports.GetReportTable(int(runID.(float64)), "3.4")
+	report, err := bps.Reports.GetReportTable(runIDInt, "3.4")
 	if err != nil {
 		return fmt.Errorf("failed to get report table: %w", err)
 	}
 	fmt.Printf("Report section 3.4:\n%+v\n", report)
-
 	return nil
+}
+
+func intValue(v interface{}) int {
+	switch vv := v.(type) {
+	case float64:
+		return int(vv)
+	case int:
+		return vv
+	default:
+		return 0
+	}
+}
+
+func boolValue(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
+}
+
+func toInt(v interface{}) int {
+	switch v := v.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		i, _ := strconv.Atoi(v)
+		return i
+	default:
+		return 0
+	}
 }
 
 func main() {
@@ -291,7 +260,7 @@ func main() {
 	searchTestModel(bps)
 
 	if err := setActiveComponents(bps); err != nil {
-		log.Fatalf("Falha ao configurar componentes: %v", err)
+		log.Fatalf("Failed to configure components: %v", err)
 	}
 
 	searchAndLoadNetworkConfig(bps)
