@@ -22,6 +22,10 @@ const (
 	APIVersion    = "v2"
 )
 
+var (
+	runID int
+)
+
 type BPS struct {
 	Host          string
 	User          string
@@ -68,15 +72,15 @@ func NewBPS(host, user, password string, checkVersion bool) *BPS {
 	client.SetTimeout(30 * time.Second)
 
 	bps := &BPS{
-		Host:            host,
-		User:            user,
-		Password:        password,
-		Client:          client,
-		ClientVersion:   parseVersion(ClientVersion),
-		CheckVersion:    checkVersion,
-		PrintRequests:   false,
+		Host:             host,
+		User:             user,
+		Password:         password,
+		Client:           client,
+		ClientVersion:    parseVersion(ClientVersion),
+		CheckVersion:     checkVersion,
+		PrintRequests:    false,
 		ProfilingEnabled: false,
-		ProfilingData:   make(map[string]map[string][]float64),
+		ProfilingData:    make(map[string]map[string][]float64),
 	}
 
 	bps.Results = models.NewDataModelProxy(bps, "results", "")
@@ -88,19 +92,19 @@ func NewBPS(host, user, password string, checkVersion bool) *BPS {
 	bps.EvasionProfile = models.NewDataModelProxy(bps, "evasionProfile", "")
 	bps.Remote = models.NewDataModelProxy(bps, "remote", "")
 
-	bps.StrikeList        = &operations.StrikeListOps{Client: bps}
-	bps.Strikes           = &operations.StrikesOps{Client: bps}
-	bps.Reports           = &operations.ReportsOps{Client: bps}
-	bps.AppProfile        = &operations.AppProfileOps{Client: bps}
-	bps.Superflow         = &operations.SuperflowOps{Client: bps}
-	bps.TestModel         = &operations.TestModelOps{Client: bps}
-	bps.Statistics        = &operations.StatisticsOps{Client: bps}
+	bps.StrikeList = &operations.StrikeListOps{Client: bps}
+	bps.Strikes = &operations.StrikesOps{Client: bps}
+	bps.Reports = &operations.ReportsOps{Client: bps}
+	bps.AppProfile = &operations.AppProfileOps{Client: bps}
+	bps.Superflow = &operations.SuperflowOps{Client: bps}
+	bps.TestModel = &operations.TestModelOps{Client: bps}
+	bps.Statistics = &operations.StatisticsOps{Client: bps}
 	bps.AdministrationOps = &operations.AdministrationOps{Client: bps}
-	bps.TopologyOps       = &operations.TopologyOps{Client: bps}
-	bps.LoadProfileOps    = &operations.LoadProfileOps{Client: bps}
-	bps.NetworkOps        = &operations.NetworkOps{Client: bps}
+	bps.TopologyOps = &operations.TopologyOps{Client: bps}
+	bps.LoadProfileOps = &operations.LoadProfileOps{Client: bps}
+	bps.NetworkOps = &operations.NetworkOps{Client: bps}
 	bps.EvasionProfileOps = &operations.EvasionProfileOps{Client: bps}
-	bps.RemoteOps         = &operations.RemoteOps{Client: bps}
+	bps.RemoteOps = &operations.RemoteOps{Client: bps}
 
 	return bps
 }
@@ -450,4 +454,96 @@ func (b *BPS) PrintProfilingData() {
 			fmt.Printf("%s %s: n=%d, avg=%.6f, min=%.6f, max=%.6f\n", method, args, count, sum/float64(count), min, max)
 		}
 	}
+}
+
+func (b *BPS) RunTest(modelname string, group int, allowMalware bool) (interface{}, error) {
+	result, err := b.TestModel.Run(modelname, group, allowMalware)
+	if err != nil {
+		return nil, fmt.Errorf("run test error: %w", err)
+	}
+
+	runID, ok := result.(map[string]interface{})["runid"]
+	if !ok {
+		return nil, fmt.Errorf("runid not found in run result")
+	}
+	return runID, nil
+}
+
+func intValue(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	switch value := v.(type) {
+	case int:
+		return value
+	case float64:
+		return int(value)
+	}
+	return 0
+}
+func strValue(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch value := v.(type) {
+	case string:
+		return value
+	}
+	return fmt.Sprintf("%v", v)
+}
+func boolValue(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return false
+}
+
+func (b *BPS) PollTestProgress(runID interface{}) (map[string]interface{}, error) {
+	var runIDStr string
+	switch v := runID.(type) {
+	case float64:
+		runIDStr = fmt.Sprintf("%.0f", v)
+	case int:
+		runIDStr = fmt.Sprintf("%d", v)
+	case string:
+		runIDStr = v
+	default:
+		runIDStr = fmt.Sprintf("%v", v)
+	}
+
+	path := fmt.Sprintf("/topology/runningTest/TEST-%s", runIDStr)
+
+	var lastData map[string]interface{}
+
+	resp, err := b.Get(path, nil, nil)
+	if err != nil {
+		return lastData, fmt.Errorf("error getting runningTest info: %w", err)
+	}
+
+	if resp == nil {
+		return map[string]interface{}{"resource_gone": true}, nil
+	}
+
+	data, ok := resp.(map[string]interface{})
+	if !ok {
+		return lastData, fmt.Errorf("unexpected response type: %#v", resp)
+	}
+
+	lastData = data
+	progress := intValue(data["progress"])
+	initProgress := intValue(data["initProgress"])
+	phase := strValue(data["phase"])
+	state := strValue(data["state"])
+	completed := boolValue(data["completed"])
+	fmt.Printf("\rPhase: %s, State: %s, Progress: %d%%, InitProgress: %d%%, Completed: %v        ",
+		phase, state, progress, initProgress, completed)
+
+	if completed || progress >= 100 {
+		return lastData, nil
+	}
+
+	return lastData, nil
 }
