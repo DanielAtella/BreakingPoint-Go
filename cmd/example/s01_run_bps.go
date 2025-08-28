@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"bps-client-go/pkg/client"
@@ -20,7 +22,7 @@ var (
 	slotNumber        = 1
 	portList          = []int{0, 1, 4, 5}
 	modelComponentAct []string
-	runID             int
+	globalRunID       int
 )
 
 func loginToBps() *client.BPS {
@@ -33,53 +35,43 @@ func loginToBps() *client.BPS {
 
 func setActiveComponents(bps *client.BPS) error {
 	fmt.Println("Adjusting Test Model components state...")
-
 	compsRaw, err := bps.TestModel.ListComponents()
 	if err != nil {
 		return fmt.Errorf("failed to list components: %w", err)
 	}
-
 	comps, ok := compsRaw.([]interface{})
 	if !ok {
 		return fmt.Errorf("unexpected response while listing components: %#v", compsRaw)
 	}
-
 	activeWanted := make(map[string]bool)
 	for _, name := range modelComponentAct {
 		activeWanted[strings.TrimSpace(name)] = true
 	}
-
 	changed := false
 	for _, comp := range comps {
 		c, ok := comp.(map[string]interface{})
 		if !ok {
 			continue
 		}
-
 		label := fmt.Sprintf("%v", c["label"])
-
 		idStr, ok := c["id"].(string)
 		if !ok {
 			return fmt.Errorf("component ID is not a string: %#v", c["id"])
 		}
-
 		active := boolValue(c["active"])
 		wantActive := activeWanted[label]
-
 		if active != wantActive {
 			stateStr := "inactive"
 			if wantActive {
 				stateStr = "active"
 			}
 			fmt.Printf("Component '%s' state changed to %s\n", label, stateStr)
-
 			if _, err := bps.TestModel.SetComponentActive(idStr, wantActive); err != nil {
 				return fmt.Errorf("failed to update component %s: %w", label, err)
 			}
 			changed = true
 		}
 	}
-
 	if changed {
 		fmt.Println("Saving component changes...")
 		_, err := bps.TestModel.Save(modelName, true)
@@ -87,7 +79,6 @@ func setActiveComponents(bps *client.BPS) error {
 			return fmt.Errorf("failed to save components: %w", err)
 		}
 	}
-
 	return nil
 }
 
@@ -103,7 +94,6 @@ func searchTestModel(bps *client.BPS) {
 		os.Exit(1)
 	}
 	fmt.Printf("Search result: %+v\n", searchResult)
-
 	fmt.Println("Loading test model...")
 	if _, err := bps.TestModel.Load(modelName, true); err != nil {
 		log.Fatalf("Failed to load model: %v", err)
@@ -119,7 +109,6 @@ func searchAndLoadNetworkConfig(bps *client.BPS) {
 		os.Exit(1)
 	}
 	fmt.Printf("Network search result: %+v\n", nnList)
-
 	fmt.Println("Loading network config...")
 	if _, err := bps.NetworkOps.Load(networkName); err != nil {
 		log.Fatalf("Failed to load network config: %v", err)
@@ -151,12 +140,19 @@ func unreservePorts(bps *client.BPS) {
 }
 
 func runTestAndPoll(bps *client.BPS, modelName string) error {
-	runID, err := bps.RunTest(modelName, 2, false)
+	result, err := bps.TestModel.Run(modelName, 2, false)
 	if err != nil {
 		return fmt.Errorf("run test error: %w", err)
 	}
 
+	runID, ok := result.(map[string]interface{})["runid"]
+	if !ok {
+		return fmt.Errorf("runid not found in run result")
+	}
+
 	fmt.Printf("Test running with runID: %v\n", runID)
+
+	globalRunID = toInt(runID)
 
 	var lastData map[string]interface{}
 	for {
@@ -164,25 +160,20 @@ func runTestAndPoll(bps *client.BPS, modelName string) error {
 		if err != nil {
 			return fmt.Errorf("poll test progress error: %w", err)
 		}
-
 		if gone, ok := lastData["resource_gone"].(bool); ok && gone {
 			fmt.Println("\nTest completed/cancelled; resource no longer available, ending polling.")
 			break
 		}
-
 		progress := intValue(lastData["progress"])
 		completed := boolValue(lastData["completed"])
-
 		if completed || progress >= 100 {
 			fmt.Println("Test completed.")
 			break
 		}
-
 		time.Sleep(5 * time.Second)
 	}
 
-	runIDInt := toInt(runID)
-	stats, err := bps.TestModel.RealTimeStats(runIDInt, "summary", -1, 1, "", []string{})
+	stats, err := bps.TestModel.RealTimeStats(globalRunID, "summary", -1, 1, "", []string{})
 	if err != nil {
 		return fmt.Errorf("failed to get realTimeStats: %w", err)
 	}
@@ -191,8 +182,7 @@ func runTestAndPoll(bps *client.BPS, modelName string) error {
 		finalProgress = statsMap["progress"]
 	}
 	fmt.Printf("Final progress: %v%%\n", finalProgress)
-
-	report, err := bps.Reports.GetReportTable(runIDInt, "3.4")
+	report, err := bps.Reports.GetReportTable(globalRunID, "3.4")
 	if err != nil {
 		return fmt.Errorf("failed to get report table: %w", err)
 	}
@@ -239,12 +229,10 @@ func main() {
 	bpsSystem = strings.TrimSpace(os.Getenv("BPS_SYSTEM"))
 	bpsUser = strings.TrimSpace(os.Getenv("BPS_USER"))
 	bpsPass = strings.TrimSpace(os.Getenv("BPS_PASS"))
-
 	compActEnv := strings.TrimSpace(os.Getenv("COMPONENT_ACT"))
 	if compActEnv != "" {
 		modelComponentAct = strings.Split(compActEnv, ",")
 	}
-
 	if modelName == "" || networkName == "" || bpsSystem == "" || bpsUser == "" || bpsPass == "" || len(modelComponentAct) == 0 {
 		log.Fatal("Please set MODEL_NAME, NETWORK_NAME, BPS_SYSTEM, BPS_USER, BPS_PASS and COMPONENT_ACT environment variables")
 	}
@@ -257,6 +245,9 @@ func main() {
 		}
 	}()
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
 	searchTestModel(bps)
 
 	if err := setActiveComponents(bps); err != nil {
@@ -266,9 +257,32 @@ func main() {
 	searchAndLoadNetworkConfig(bps)
 	reservePorts(bps)
 
-	if err := runTestAndPoll(bps, modelName); err != nil {
-		log.Fatalf("Test run failed: %v", err)
+	errChan := make(chan error, 1)
+	go func() {
+		err := runTestAndPoll(bps, modelName)
+		errChan <- err
+	}()
+
+	select {
+	case <-sigs:
+		fmt.Println("\nInterrupt received, stopping running test on BPS...")
+		if globalRunID > 0 {
+			_, err := bps.TestModel.Stop(globalRunID)
+			if err != nil {
+				fmt.Printf("Error canceling test: %v\n", err)
+			} else {
+				fmt.Println("Test was canceled successfully.")
+			}
+		}
+		unreservePorts(bps)
+
+	case err := <-errChan:
+		if err != nil {
+			log.Fatalf("Test run failed: %v", err)
+		}
+		fmt.Println("Test completed normally.")
+		unreservePorts(bps)
 	}
 
-	unreservePorts(bps)
+	fmt.Println("Cleanup complete, exiting.")
 }
